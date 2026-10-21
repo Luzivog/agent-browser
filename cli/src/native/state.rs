@@ -466,6 +466,22 @@ pub fn merge_state(
     StorageState { cookies, origins }
 }
 
+/// The baseline after a save that collected `current`: its cookies and the
+/// origins it read, plus `previous`'s copy of every origin it did not read.
+/// Dropping those would make a later read of their unchanged storage look new
+/// and overwrite what another session published for them since.
+pub fn advance_baseline(previous: StorageState, current: StorageState) -> StorageState {
+    let read: HashSet<&str> = current.origins.iter().map(|o| o.origin.as_str()).collect();
+    let unread: Vec<OriginStorage> = previous
+        .origins
+        .into_iter()
+        .filter(|o| !read.contains(o.origin.as_str()))
+        .collect();
+    let mut next = current;
+    next.origins.extend(unread);
+    next
+}
+
 /// Save this session's state for the restore key `session_name`, merged into
 /// the newest state any session published for that key (see `merge_state`).
 ///
@@ -1365,6 +1381,28 @@ mod tests {
             local_pairs(&merged, site),
             Some(vec![("token", "from-other")])
         );
+    }
+
+    #[test]
+    fn test_baseline_of_unread_origin_survives_a_save() {
+        let site = "https://site.example";
+        // A restores the site with k=v1.
+        let restored = storage(vec![], vec![origin(site, &[("k", "v1")])]);
+        let mut a_baseline = restored.clone();
+
+        // A's next save does not read the site.
+        let a_first = StorageState::default();
+        let published = merge_state(restored, &a_baseline, &a_first, NOW);
+        a_baseline = advance_baseline(a_baseline, a_first);
+
+        // B, which loaded that file, publishes k=v2.
+        let b_current = storage(vec![], vec![origin(site, &[("k", "v2")])]);
+        let b_published = merge_state(published.clone(), &published, &b_current, NOW);
+
+        // A visits the site, where its browser still holds k=v1, and saves.
+        let a_second = storage(vec![], vec![origin(site, &[("k", "v1")])]);
+        let merged = merge_state(b_published, &a_baseline, &a_second, NOW);
+        assert_eq!(local_pairs(&merged, site), Some(vec![("k", "v2")]));
     }
 
     #[test]
