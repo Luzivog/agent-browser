@@ -644,7 +644,8 @@ pub struct DaemonState {
     pub restore_saved_path: Option<String>,
     /// What this session last loaded from or published to its restore key.
     /// An autosave publishes only its changes since then, so sessions sharing
-    /// a key keep each other's sign-ins.
+    /// a key keep each other's sign-ins. A save that does not read an origin
+    /// keeps that origin's earlier baseline (`state::advance_baseline`).
     pub restore_baseline: state::StorageState,
     /// When the most recent browser-touching command finished. Periodic
     /// autosaves wait for a quiet period after this so a multi-second save
@@ -4896,7 +4897,8 @@ pub(crate) async fn auto_save_restore_state(
     .await
     {
         Ok((path, collected)) => {
-            state.restore_baseline = collected;
+            state.restore_baseline =
+                state::advance_baseline(std::mem::take(&mut state.restore_baseline), collected);
             state.restore_save_status = "saved".to_string();
             state.restore_saved_path = Some(path.clone());
             // Saves from any path (close, relaunch, restore-key change) reset
