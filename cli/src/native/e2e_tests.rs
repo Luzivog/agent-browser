@@ -11347,14 +11347,27 @@ async fn e2e_restore_saves_cookie_rotated_while_restoring_storage() {
     let resp = execute_command(&open("3", format!("{}/other", base_url)), &mut b).await;
     assert_success(&resp);
     assert_eq!(get_data(&resp)["lifecycle"]["restoreStatus"], "loaded");
-    assert_evaluate(&mut b, "4", "document.cookie", json!("rot=2")).await;
+    // Chrome may request `/` more than once while restoring, so read the
+    // value B holds instead of assuming one rotation.
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "evaluate", "script": "document.cookie" }),
+        &mut b,
+    )
+    .await;
+    assert_success(&resp);
+    let rotated = get_data(&resp)["result"]
+        .as_str()
+        .and_then(|c| c.strip_prefix("rot="))
+        .map(str::to_string);
+    assert!(
+        rotated.as_deref().is_some_and(|v| v != "1"),
+        "restore should rotate the cookie: {:?}",
+        rotated
+    );
     let resp = execute_command(&json!({ "id": "5", "action": "close" }), &mut b).await;
     assert_eq!(get_data(&resp)["saveStatus"], "saved");
 
-    assert_eq!(
-        newest_saved_cookie(&restore_key, "rot").as_deref(),
-        Some("2")
-    );
+    assert_eq!(newest_saved_cookie(&restore_key, "rot"), rotated);
     cleanup_restore_state_files(&restore_key);
 }
 
