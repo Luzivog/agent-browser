@@ -1,0 +1,123 @@
+name: Leadlord release
+
+# Leadlord's build: a Linux x64 npm package attached to a GitHub release for
+# the pushed tag. Adapted from release.yml; nothing is published to npm.
+
+on:
+  push:
+    tags:
+      - 'v*-leadlord.*'
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build and release Linux x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Check the tag matches the package version
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
+            echo "ERROR: tag ${GITHUB_REF_NAME} does not match package.json version ${VERSION}"
+            exit 1
+          fi
+          node scripts/check-version-sync.js
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install npm dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build dashboard
+        run: pnpm --filter dashboard build
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install cargo-zigbuild
+        run: |
+          pip3 install ziglang
+          cargo install cargo-zigbuild --version 0.23.2 --locked
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+
+      - name: Run Rust tests
+        run: cargo test --profile ci --manifest-path cli/Cargo.toml
+
+      - name: Build with zigbuild
+        run: cargo zigbuild --release --manifest-path cli/Cargo.toml --target x86_64-unknown-linux-gnu.2.28
+
+      - name: Copy binary
+        run: |
+          mkdir -p bin
+          cp cli/target/x86_64-unknown-linux-gnu/release/agent-browser bin/agent-browser-linux-x64
+          chmod +x bin/agent-browser-linux-x64
+
+      - name: Verify Linux GNU glibc floor
+        run: |
+          set -euo pipefail
+          if objdump -p bin/agent-browser-linux-x64 | grep -E 'GLIBC_2\.([3-9][0-9]|29)'; then
+            echo "ERROR: agent-browser-linux-x64 requires glibc newer than 2.28"
+            exit 1
+          fi
+          objdump -p bin/agent-browser-linux-x64 | sed -n '/Version References:/,$p'
+
+      - name: Verify binary version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          ACTUAL=$(bin/agent-browser-linux-x64 --version)
+          echo "$ACTUAL"
+          case "$ACTUAL" in
+            *"$VERSION") ;;
+            *) echo "ERROR: binary reports '$ACTUAL', expected $VERSION"; exit 1 ;;
+          esac
+
+      - name: Pack npm package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm pack
+          TGZ="agent-browser-${VERSION}.tgz"
+          tar -tzf "$TGZ" | grep -x 'package/bin/agent-browser-linux-x64' > /dev/null
+          sha256sum "$TGZ" > "$TGZ.sha256"
+          cat "$TGZ.sha256"
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          TGZ="agent-browser-${VERSION}.tgz"
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "Leadlord's build of agent-browser: npm package for Linux x64 (glibc 2.28+). Install with npm install -g ${TGZ}." \
+            "$TGZ" "$TGZ.sha256"
