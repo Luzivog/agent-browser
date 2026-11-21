@@ -1,6 +1,6 @@
 {
   "name": "dashboard",
-  "version": "0.39.1-leadlord.2",
+  "version": "0.39.1-leadlord.3",
   "private": true,
   "scripts": {
     "dev": "next dev",
