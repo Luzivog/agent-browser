@@ -27,8 +27,6 @@ pub struct StorageState {
 pub struct OriginStorage {
     pub origin: String,
     pub local_storage: Vec<StorageEntry>,
-    #[serde(default)]
-    pub session_storage: Vec<StorageEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -73,15 +71,9 @@ fn parse_origin_storage(data: &Value) -> Option<OriginStorage> {
         .get("localStorage")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
-    let session_storage: Vec<StorageEntry> = data
-        .get("sessionStorage")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-
     Some(OriginStorage {
         origin,
         local_storage,
-        session_storage,
     })
 }
 
@@ -103,15 +95,26 @@ async fn eval_value(client: &CdpClient, session_id: &str, expression: &str) -> O
     result.result.value
 }
 
+/// The longest one pass over saved origins may take, so a launch's restore
+/// stops growing with the saved state. The restore runs inside the launch
+/// command, which the CLI waits on for 30 s (`read_timeout_for`): browser
+/// start-up took up to 3.4 s on a loaded machine and the cookies under 1 s
+/// (measured), and closing the blank tab may take up to 5 s, which leaves
+/// about 20 s; 15 s keeps 5 s of it as margin. A save's pass, which runs
+/// inside a command too, gets the same bound.
+const BLANK_ORIGINS_BUDGET: tokio::time::Duration = tokio::time::Duration::from_secs(15);
+
 /// Open a disposable tab, load each origin in it and evaluate `script(origin)`
 /// there, then close the tab. Fetch interception answers every request with a
 /// blank page, so no request leaves the browser and no page script runs, and
-/// the session's own tabs never navigate. Returns each origin whose script
-/// returned a value, with that value; an origin that does not load is skipped.
-async fn eval_in_blank_origins(
+/// the session's own tabs never navigate. Origins are visited in order until
+/// `budget` runs out. Returns each origin whose script returned a value, with
+/// that value; an origin that does not load in time is skipped.
+pub(crate) async fn eval_in_blank_origins(
     client: &CdpClient,
     origins: &[String],
     script: &(dyn Fn(&str) -> String + Sync),
+    budget: tokio::time::Duration,
 ) -> Result<Vec<(String, Value)>, String> {
     let create_result: CreateTargetResult = client
         .send_command_typed(
@@ -126,7 +129,7 @@ async fn eval_in_blank_origins(
     let target_id = create_result.target_id;
 
     // Ensure the target is closed even if attach or later steps fail
-    let result = eval_in_target(client, &target_id, origins, script).await;
+    let result = eval_in_target(client, &target_id, origins, script, budget).await;
 
     // closeTarget answers before the tab is gone. After each command the
     // daemon handles the tabs it discovered; a command it sends this tab
@@ -169,6 +172,7 @@ async fn eval_in_target(
     target_id: &str,
     origins: &[String],
     script: &(dyn Fn(&str) -> String + Sync),
+    budget: tokio::time::Duration,
 ) -> Result<Vec<(String, Value)>, String> {
     let attach_result: AttachToTargetResult = client
         .send_command_typed(
@@ -186,7 +190,7 @@ async fn eval_in_target(
     // request handler would continue its paused requests to the network
     // before this loop could answer them with a blank page.
     let mut events = client.subscribe_session(temp_session);
-    let result = eval_in_session(client, temp_session, &mut events, origins, script).await;
+    let result = eval_in_session(client, temp_session, &mut events, origins, script, budget).await;
     client.unsubscribe_session(temp_session);
     result
 }
@@ -197,7 +201,9 @@ async fn eval_in_session(
     events: &mut tokio::sync::mpsc::Receiver<super::cdp::types::CdpEvent>,
     origins: &[String],
     script: &(dyn Fn(&str) -> String + Sync),
+    budget: tokio::time::Duration,
 ) -> Result<Vec<(String, Value)>, String> {
+    let pass_end = tokio::time::Instant::now() + budget;
     client
         .send_command_no_params("Page.enable", Some(temp_session))
         .await?;
@@ -214,6 +220,9 @@ async fn eval_in_session(
     let mut results = Vec::new();
 
     for target_origin in origins {
+        if tokio::time::Instant::now() >= pass_end {
+            break;
+        }
         while events.try_recv().is_ok() {}
         let nav_url = format!("{}/", target_origin.trim_end_matches('/'));
         // Chrome answers Page.navigate only once the paused request is
@@ -231,7 +240,9 @@ async fn eval_in_session(
         {
             continue;
         }
-        let deadline = tokio::time::sleep(tokio::time::Duration::from_secs(5));
+        let deadline = tokio::time::sleep_until(
+            (tokio::time::Instant::now() + tokio::time::Duration::from_secs(5)).min(pass_end),
+        );
         tokio::pin!(deadline);
         let page_loaded = loop {
             tokio::select! {
@@ -317,17 +328,11 @@ async fn collect_state(
     let cookies = cookies::get_all_cookies(client, session_id).await?;
 
     let origin_js = r#"(() => {
-        const result = { origin: location.origin, localStorage: [], sessionStorage: [] };
+        const result = { origin: location.origin, localStorage: [] };
         try {
             for (let i = 0; i < localStorage.length; i++) {
                 const key = localStorage.key(i);
                 result.localStorage.push({ name: key, value: localStorage.getItem(key) });
-            }
-        } catch(e) {}
-        try {
-            for (let i = 0; i < sessionStorage.length; i++) {
-                const key = sessionStorage.key(i);
-                result.sessionStorage.push({ name: key, value: sessionStorage.getItem(key) });
             }
         } catch(e) {}
         return result;
@@ -361,9 +366,12 @@ async fn collect_state(
     all_origins.remove(&current_origin);
     if !all_origins.is_empty() {
         let remaining: Vec<String> = all_origins.into_iter().collect();
-        if let Ok(read) = Box::pin(eval_in_blank_origins(client, &remaining, &|_| {
-            origin_js.to_string()
-        }))
+        if let Ok(read) = Box::pin(eval_in_blank_origins(
+            client,
+            &remaining,
+            &|_| origin_js.to_string(),
+            BLANK_ORIGINS_BUDGET,
+        ))
         .await
         {
             origins.extend(read.iter().filter_map(|(_, v)| parse_origin_storage(v)));
@@ -376,9 +384,7 @@ async fn collect_state(
 /// Write `state` to `path` (with `.enc` appended when encryption is on) and
 /// return the path written. Origins with no stored entries are left out.
 fn write_state_file(mut state: StorageState, mut path: String) -> Result<String, String> {
-    state
-        .origins
-        .retain(|o| !o.local_storage.is_empty() || !o.session_storage.is_empty());
+    state.origins.retain(|o| !o.local_storage.is_empty());
     let json_str = serde_json::to_string_pretty(&state)
         .map_err(|e| format!("Failed to serialize state: {}", e))?;
 
@@ -477,23 +483,17 @@ pub fn merge_state(
 
     let mut origins = Vec::with_capacity(current.origins.len().max(newest_origins.len()));
     for cur in &current.origins {
-        let (newest_local, newest_session) = newest_origins
+        let newest_local = newest_origins
             .remove(&cur.origin)
-            .map(|o| (o.local_storage, o.session_storage))
+            .map(|o| o.local_storage)
             .unwrap_or_default();
-        let (base_local, base_session) = base_origins
+        let base_local = base_origins
             .get(cur.origin.as_str())
-            .map(|o| (o.local_storage.as_slice(), o.session_storage.as_slice()))
+            .map(|o| o.local_storage.as_slice())
             .unwrap_or_default();
         origins.push(OriginStorage {
             origin: cur.origin.clone(),
             local_storage: merge_entries(newest_local, base_local, &cur.local_storage, entry_key),
-            session_storage: merge_entries(
-                newest_session,
-                base_session,
-                &cur.session_storage,
-                entry_key,
-            ),
         });
     }
     for origin in newest_order {
@@ -682,14 +682,30 @@ pub fn validate_state_file(path: &str) -> Result<(), String> {
 ///
 /// localStorage is written in a disposable blank tab (`eval_in_blank_origins`),
 /// so a restore never navigates the session's tab or sends a request: it
-/// cannot leave the session on another session's page, reload a page the
-/// session is using, or take a site's page load per saved origin before the
-/// session's first command. sessionStorage belongs to the tab that wrote it
-/// and ends with it, so a new browser starts without it, as it would by hand.
+/// cannot leave the session on another session's page or reload a page the
+/// session is using. Origins are written in the file's order, which a save
+/// leads with the origins it read, within `BLANK_ORIGINS_BUDGET`; the rest
+/// stay in the file for a later restore, and out of the returned baseline, so
+/// no save mistakes them for deleted.
 pub async fn load_state(
     client: &CdpClient,
     session_id: &str,
     path: &str,
+) -> Result<StorageState, String> {
+    Box::pin(load_state_within(
+        client,
+        session_id,
+        path,
+        BLANK_ORIGINS_BUDGET,
+    ))
+    .await
+}
+
+pub(crate) async fn load_state_within(
+    client: &CdpClient,
+    session_id: &str,
+    path: &str,
+    budget: tokio::time::Duration,
 ) -> Result<StorageState, String> {
     let mut state = read_state(path)?;
 
@@ -705,10 +721,10 @@ pub async fn load_state(
         .await
         .unwrap_or_default();
 
+    state.origins.retain(|o| !o.local_storage.is_empty());
     let scripts: HashMap<String, String> = state
         .origins
         .iter()
-        .filter(|o| !o.local_storage.is_empty())
         .map(|o| {
             let entries: Vec<(&str, &str)> = o
                 .local_storage
@@ -724,18 +740,17 @@ pub async fn load_state(
         .collect();
     let mut written = HashSet::new();
     if !scripts.is_empty() {
-        let origins: Vec<String> = scripts.keys().cloned().collect();
+        let origins: Vec<String> = state.origins.iter().map(|o| o.origin.clone()).collect();
         let script = |origin: &str| scripts.get(origin).cloned().unwrap_or_default();
-        for (origin, value) in Box::pin(eval_in_blank_origins(client, &origins, &script)).await? {
+        for (origin, value) in
+            Box::pin(eval_in_blank_origins(client, &origins, &script, budget)).await?
+        {
             if value == Value::Bool(true) {
                 written.insert(origin);
             }
         }
     }
     state.origins.retain(|o| written.contains(&o.origin));
-    for origin in &mut state.origins {
-        origin.session_storage.clear();
-    }
 
     Ok(state)
 }
@@ -1074,7 +1089,6 @@ mod tests {
                     name: "key".to_string(),
                     value: "val".to_string(),
                 }],
-                session_storage: vec![],
             }],
         };
 
@@ -1276,7 +1290,6 @@ mod tests {
                     value: value.to_string(),
                 })
                 .collect(),
-            session_storage: vec![],
         }
     }
 
@@ -1303,9 +1316,7 @@ mod tests {
 
     /// What `write_state_file` would publish for `state`.
     fn published(mut state: StorageState) -> StorageState {
-        state
-            .origins
-            .retain(|o| !o.local_storage.is_empty() || !o.session_storage.is_empty());
+        state.origins.retain(|o| !o.local_storage.is_empty());
         state
     }
 

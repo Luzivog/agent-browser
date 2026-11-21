@@ -11373,6 +11373,82 @@ async fn e2e_restore_loads_storage_without_visiting_its_origins() {
     cleanup_restore_state_files(&restore_key);
 }
 
+/// A restore stops at its time budget however many origins the state holds,
+/// writing them in the file's order: a launch's restore grew with every saved
+/// origin until it passed the CLI's 30 s wait. The origins in the middle are
+/// URLs Chrome cannot navigate to, so each would hold the pass for its whole
+/// 5 s, as a slow site does on a loaded machine.
+#[tokio::test]
+#[ignore]
+async fn e2e_restore_stops_at_its_budget_in_file_order() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_ENCRYPTION_KEY"]);
+    env.remove("AGENT_BROWSER_ENCRYPTION_KEY");
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let origin =
+        |name: &str| json!({ "origin": name, "localStorage": [{ "name": "k", "value": "v" }] });
+    let mut origins = vec![origin("http://first.test")];
+    origins.extend((0..4).map(|i| origin(&format!("http://[never-loads-{}", i))));
+    origins.push(origin("http://last.test"));
+    let dir = std::env::temp_dir().join(format!("ab-budget-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.json");
+    std::fs::write(
+        &path,
+        json!({ "cookies": [], "origins": origins }).to_string(),
+    )
+    .unwrap();
+
+    let mgr = state.browser.as_ref().unwrap();
+    let session_id = mgr.active_session_id().unwrap().to_string();
+    let started = std::time::Instant::now();
+    let loaded = super::state::load_state_within(
+        &mgr.client,
+        &session_id,
+        path.to_str().unwrap(),
+        std::time::Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "restore took {:?}",
+        took
+    );
+    let written: Vec<&str> = loaded.origins.iter().map(|o| o.origin.as_str()).collect();
+    assert_eq!(written, vec!["http://first.test"]);
+
+    let read = super::state::eval_in_blank_origins(
+        &mgr.client,
+        &[
+            "http://first.test".to_string(),
+            "http://last.test".to_string(),
+        ],
+        &|_| "localStorage.getItem('k') ?? 'missing'".to_string(),
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read,
+        vec![
+            ("http://first.test".to_string(), json!("v")),
+            ("http://last.test".to_string(), json!("missing")),
+        ]
+    );
+
+    let resp = execute_command(&json!({ "id": "2", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 #[ignore]
 async fn e2e_restore_keeps_saved_cookie_the_browser_refused() {

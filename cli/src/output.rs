@@ -3084,7 +3084,7 @@ agent-browser state - Manage browser state
 
 Usage: agent-browser state <operation> [args]
 
-Save, restore, list, and manage browser state (cookies, localStorage, sessionStorage).
+Save, restore, list, and manage browser state (cookies and localStorage).
 
 Operations:
   save <path>                        Save current state to file
