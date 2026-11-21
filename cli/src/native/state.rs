@@ -128,13 +128,38 @@ async fn eval_in_blank_origins(
     // Ensure the target is closed even if attach or later steps fail
     let result = eval_in_target(client, &target_id, origins, script).await;
 
-    let _ = client
+    // closeTarget answers before the tab is gone. After each command the
+    // daemon handles the tabs it discovered; a command it sends this tab
+    // while the tab closes gets no answer for 30 s, past the CLI's wait.
+    // Once the tab is destroyed, the daemon finds nothing to send it.
+    let mut browser_events = client.subscribe();
+    let closed = client
         .send_command_typed::<_, Value>(
             "Target.closeTarget",
-            &CloseTargetParams { target_id },
+            &CloseTargetParams {
+                target_id: target_id.clone(),
+            },
             None,
         )
         .await;
+    if closed.is_ok() {
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            loop {
+                match browser_events.recv().await {
+                    Ok(event)
+                        if event.method == "Target.targetDestroyed"
+                            && event.params.get("targetId").and_then(|v| v.as_str())
+                                == Some(target_id.as_str()) =>
+                    {
+                        break
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+        .await;
+    }
 
     result
 }
@@ -192,24 +217,24 @@ async fn eval_in_session(
         while events.try_recv().is_ok() {}
         let nav_url = format!("{}/", target_origin.trim_end_matches('/'));
         // Chrome answers Page.navigate only once the paused request is
-        // answered, so the navigation runs alongside the loop that answers it.
-        let mut navigate = Box::pin(client.send_command(
-            "Page.navigate",
-            Some(json!({ "url": nav_url })),
-            Some(temp_session),
-        ));
-        let mut navigating = true;
+        // answered, so the navigation is sent without waiting for its answer;
+        // a command future awaited alongside this loop could hold the
+        // connection's lock while the loop waits for it.
+        if client
+            .send_command_no_wait(
+                "Page.navigate",
+                Some(json!({ "url": nav_url })),
+                Some(temp_session),
+            )
+            .await
+            .is_err()
+        {
+            continue;
+        }
         let deadline = tokio::time::sleep(tokio::time::Duration::from_secs(5));
         tokio::pin!(deadline);
         let page_loaded = loop {
             tokio::select! {
-                result = &mut navigate, if navigating => {
-                    navigating = false;
-                    match result {
-                        Ok(r) if r.get("errorText").is_none() => {}
-                        _ => break false,
-                    }
-                }
                 event = events.recv() => match event {
                     Some(evt) if evt.method == "Fetch.requestPaused" => {
                         if let Some(request_id) =
