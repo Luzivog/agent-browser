@@ -85,17 +85,14 @@ fn parse_origin_storage(data: &Value) -> Option<OriginStorage> {
     })
 }
 
-/// Evaluate the storage-collection JS snippet and parse the result.
-async fn eval_origin_storage(
-    client: &CdpClient,
-    session_id: &str,
-    origin_js: &str,
-) -> Option<OriginStorage> {
+/// Evaluate `expression` in `session_id` and return its value, or `None` when
+/// the evaluation fails or throws.
+async fn eval_value(client: &CdpClient, session_id: &str, expression: &str) -> Option<Value> {
     let result = client
         .send_command_typed::<_, super::cdp::types::EvaluateResult>(
             "Runtime.evaluate",
             &EvaluateParams {
-                expression: origin_js.to_string(),
+                expression: expression.to_string(),
                 return_by_value: Some(true),
                 await_promise: Some(false),
             },
@@ -103,18 +100,19 @@ async fn eval_origin_storage(
         )
         .await
         .ok()?;
-    let data = result.result.value.unwrap_or(Value::Null);
-    parse_origin_storage(&data)
+    result.result.value
 }
 
-/// Create a temporary CDP target, navigate it to each origin to collect localStorage,
-/// then close it. Uses Fetch interception to serve blank HTML instead of making real
-/// network requests.
-async fn collect_storage_via_temp_target(
+/// Open a disposable tab, load each origin in it and evaluate `script(origin)`
+/// there, then close the tab. Fetch interception answers every request with a
+/// blank page, so no request leaves the browser and no page script runs, and
+/// the session's own tabs never navigate. Returns each origin whose script
+/// returned a value, with that value; an origin that does not load is skipped.
+async fn eval_in_blank_origins(
     client: &CdpClient,
     origins: &[String],
-    origin_js: &str,
-) -> Result<Vec<OriginStorage>, String> {
+    script: &(dyn Fn(&str) -> String + Sync),
+) -> Result<Vec<(String, Value)>, String> {
     let create_result: CreateTargetResult = client
         .send_command_typed(
             "Target.createTarget",
@@ -128,7 +126,7 @@ async fn collect_storage_via_temp_target(
     let target_id = create_result.target_id;
 
     // Ensure the target is closed even if attach or later steps fail
-    let result = collect_storage_in_target(client, &target_id, origins, origin_js).await;
+    let result = eval_in_target(client, &target_id, origins, script).await;
 
     let _ = client
         .send_command_typed::<_, Value>(
@@ -141,12 +139,12 @@ async fn collect_storage_via_temp_target(
     result
 }
 
-async fn collect_storage_in_target(
+async fn eval_in_target(
     client: &CdpClient,
     target_id: &str,
     origins: &[String],
-    origin_js: &str,
-) -> Result<Vec<OriginStorage>, String> {
+    script: &(dyn Fn(&str) -> String + Sync),
+) -> Result<Vec<(String, Value)>, String> {
     let attach_result: AttachToTargetResult = client
         .send_command_typed(
             "Target.attachToTarget",
@@ -159,49 +157,61 @@ async fn collect_storage_in_target(
         .await?;
 
     let temp_session = &attach_result.session_id;
+    // The tab's events come only here. On the shared broadcast, the daemon's
+    // request handler would continue its paused requests to the network
+    // before this loop could answer them with a blank page.
+    let mut events = client.subscribe_session(temp_session);
+    let result = eval_in_session(client, temp_session, &mut events, origins, script).await;
+    client.unsubscribe_session(temp_session);
+    result
+}
 
+async fn eval_in_session(
+    client: &CdpClient,
+    temp_session: &str,
+    events: &mut tokio::sync::mpsc::Receiver<super::cdp::types::CdpEvent>,
+    origins: &[String],
+    script: &(dyn Fn(&str) -> String + Sync),
+) -> Result<Vec<(String, Value)>, String> {
     client
         .send_command_no_params("Page.enable", Some(temp_session))
         .await?;
     client
-        .send_command_no_params("Runtime.enable", Some(temp_session))
-        .await?;
-
-    // Blank HTML response body, pre-encoded to avoid repeated base64 work per request
-    let blank_html_b64 = base64::engine::general_purpose::STANDARD.encode("<html></html>");
-
-    let _ = client
         .send_command(
             "Fetch.enable",
             Some(json!({ "patterns": [{ "urlPattern": "*" }] })),
             Some(temp_session),
         )
-        .await;
+        .await?;
 
-    let mut event_rx = client.subscribe();
+    // Blank HTML response body, pre-encoded to avoid repeated base64 work per request
+    let blank_html_b64 = base64::engine::general_purpose::STANDARD.encode("<html></html>");
     let mut results = Vec::new();
 
     for target_origin in origins {
+        while events.try_recv().is_ok() {}
         let nav_url = format!("{}/", target_origin.trim_end_matches('/'));
-        if client
-            .send_command(
-                "Page.navigate",
-                Some(json!({ "url": nav_url })),
-                Some(temp_session),
-            )
-            .await
-            .is_err()
-        {
-            continue;
-        }
-
-        // Fulfill intercepted requests with blank HTML until the page loads
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        let mut page_loaded = false;
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(tokio::time::Duration::from_secs(2), event_rx.recv()).await {
-                Ok(Ok(evt)) if evt.session_id.as_deref() == Some(temp_session) => {
-                    if evt.method == "Fetch.requestPaused" {
+        // Chrome answers Page.navigate only once the paused request is
+        // answered, so the navigation runs alongside the loop that answers it.
+        let mut navigate = Box::pin(client.send_command(
+            "Page.navigate",
+            Some(json!({ "url": nav_url })),
+            Some(temp_session),
+        ));
+        let mut navigating = true;
+        let deadline = tokio::time::sleep(tokio::time::Duration::from_secs(5));
+        tokio::pin!(deadline);
+        let page_loaded = loop {
+            tokio::select! {
+                result = &mut navigate, if navigating => {
+                    navigating = false;
+                    match result {
+                        Ok(r) if r.get("errorText").is_none() => {}
+                        _ => break false,
+                    }
+                }
+                event = events.recv() => match event {
+                    Some(evt) if evt.method == "Fetch.requestPaused" => {
                         if let Some(request_id) =
                             evt.params.get("requestId").and_then(|v| v.as_str())
                         {
@@ -220,23 +230,21 @@ async fn collect_storage_in_target(
                                 )
                                 .await;
                         }
-                    } else if evt.method == "Page.loadEventFired" {
-                        page_loaded = true;
-                        break;
                     }
-                }
-                Ok(Ok(_)) => continue,  // event for a different session
-                Ok(Err(_)) => continue, // lagged or closed — retry within deadline
-                Err(_) => break,        // outer timeout elapsed
+                    Some(evt) if evt.method == "Page.loadEventFired" => break true,
+                    Some(_) => {}
+                    None => break false,
+                },
+                _ = &mut deadline => break false,
             }
-        }
+        };
 
         if !page_loaded {
             continue;
         }
 
-        if let Some(storage) = eval_origin_storage(client, temp_session, origin_js).await {
-            results.push(storage);
+        if let Some(value) = eval_value(client, temp_session, &script(target_origin)).await {
+            results.push((target_origin.clone(), value));
         }
     }
 
@@ -315,7 +323,11 @@ async fn collect_state(
     let mut origins = Vec::new();
     let mut current_origin = String::new();
 
-    if let Some(storage) = eval_origin_storage(client, session_id, origin_js).await {
+    if let Some(storage) = eval_value(client, session_id, origin_js)
+        .await
+        .as_ref()
+        .and_then(parse_origin_storage)
+    {
         current_origin = storage.origin.clone();
         origins.push(storage);
     }
@@ -324,10 +336,12 @@ async fn collect_state(
     all_origins.remove(&current_origin);
     if !all_origins.is_empty() {
         let remaining: Vec<String> = all_origins.into_iter().collect();
-        if let Ok(temp_origins) =
-            collect_storage_via_temp_target(client, &remaining, origin_js).await
+        if let Ok(read) = Box::pin(eval_in_blank_origins(client, &remaining, &|_| {
+            origin_js.to_string()
+        }))
+        .await
         {
-            origins.extend(temp_origins);
+            origins.extend(read.iter().filter_map(|(_, v)| parse_origin_storage(v)));
         }
     }
 
@@ -638,12 +652,15 @@ pub fn validate_state_file(path: &str) -> Result<(), String> {
 }
 
 /// Load the state file at `path` into the browser and return what it loaded:
-/// the file's storage, and the cookies the browser holds once the file's
-/// cookies are set.
+/// the cookies the browser holds once the file's cookies are set, and the
+/// localStorage of each origin it wrote.
 ///
-/// The cookies are read back before any navigation, so a cookie the browser
-/// refused is not reported as loaded, and one a page sets or rotates while
-/// storage is restored is not mistaken for part of the file.
+/// localStorage is written in a disposable blank tab (`eval_in_blank_origins`),
+/// so a restore never navigates the session's tab or sends a request: it
+/// cannot leave the session on another session's page, reload a page the
+/// session is using, or take a site's page load per saved origin before the
+/// session's first command. sessionStorage belongs to the tab that wrote it
+/// and ends with it, so a new browser starts without it, as it would by hand.
 pub async fn load_state(
     client: &CdpClient,
     session_id: &str,
@@ -651,7 +668,6 @@ pub async fn load_state(
 ) -> Result<StorageState, String> {
     let mut state = read_state(path)?;
 
-    // Load cookies
     if !state.cookies.is_empty() {
         let cookie_values: Vec<Value> = state
             .cookies
@@ -664,62 +680,36 @@ pub async fn load_state(
         .await
         .unwrap_or_default();
 
-    // Load storage per origin
-    for origin in &state.origins {
-        if origin.local_storage.is_empty() && origin.session_storage.is_empty() {
-            continue;
-        }
-
-        // Navigate to origin to set storage
-        let navigate_url = format!("{}/", origin.origin.trim_end_matches('/'));
-        client
-            .send_command(
-                "Page.navigate",
-                Some(json!({ "url": navigate_url })),
-                Some(session_id),
-            )
-            .await?;
-
-        // Brief wait for navigation
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-        for entry in &origin.local_storage {
-            let js = format!(
-                "localStorage.setItem({}, {})",
-                serde_json::to_string(&entry.name).unwrap_or_default(),
-                serde_json::to_string(&entry.value).unwrap_or_default(),
+    let scripts: HashMap<String, String> = state
+        .origins
+        .iter()
+        .filter(|o| !o.local_storage.is_empty())
+        .map(|o| {
+            let entries: Vec<(&str, &str)> = o
+                .local_storage
+                .iter()
+                .map(|e| (e.name.as_str(), e.value.as_str()))
+                .collect();
+            let script = format!(
+                "(() => {{ for (const [k, v] of {}) localStorage.setItem(k, v); return true; }})()",
+                serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
             );
-            let _ = client
-                .send_command_typed::<_, super::cdp::types::EvaluateResult>(
-                    "Runtime.evaluate",
-                    &EvaluateParams {
-                        expression: js,
-                        return_by_value: Some(true),
-                        await_promise: Some(false),
-                    },
-                    Some(session_id),
-                )
-                .await;
+            (o.origin.clone(), script)
+        })
+        .collect();
+    let mut written = HashSet::new();
+    if !scripts.is_empty() {
+        let origins: Vec<String> = scripts.keys().cloned().collect();
+        let script = |origin: &str| scripts.get(origin).cloned().unwrap_or_default();
+        for (origin, value) in Box::pin(eval_in_blank_origins(client, &origins, &script)).await? {
+            if value == Value::Bool(true) {
+                written.insert(origin);
+            }
         }
-
-        for entry in &origin.session_storage {
-            let js = format!(
-                "sessionStorage.setItem({}, {})",
-                serde_json::to_string(&entry.name).unwrap_or_default(),
-                serde_json::to_string(&entry.value).unwrap_or_default(),
-            );
-            let _ = client
-                .send_command_typed::<_, super::cdp::types::EvaluateResult>(
-                    "Runtime.evaluate",
-                    &EvaluateParams {
-                        expression: js,
-                        return_by_value: Some(true),
-                        await_promise: Some(false),
-                    },
-                    Some(session_id),
-                )
-                .await;
-        }
+    }
+    state.origins.retain(|o| written.contains(&o.origin));
+    for origin in &mut state.origins {
+        origin.session_storage.clear();
     }
 
     Ok(state)

@@ -84,6 +84,8 @@ When `--restore` or another restore key is configured, state is loaded before na
 
 Several sessions can share one restore key, such as `--restore shared`. Each save then applies only what that session changed since it last loaded or saved on top of the newest saved state for the key, so a session that saves later does not erase sign-ins another session saved first. Each restore key also keeps an empty `<key>.lock` file in the sessions directory, which serializes these saves.
 
+A restore sets the saved cookies and writes each origin's localStorage in a temporary blank tab whose requests never leave the browser, so it never navigates the session's own tab or contacts the saved sites; sessionStorage, which ends with its tab, is not restored.
+
 ```bash
 agent-browser --session "$SESSION" --restore --restore-check-url "**/dashboard" open https://app.example.com/dashboard
 agent-browser --session "$SESSION" --restore --restore-check-text Dashboard open https://app.example.com/dashboard

@@ -6331,8 +6331,8 @@ async fn start_cookie_login_server() -> (String, tokio::task::JoinHandle<()>) {
 }
 
 /// Starts a tiny HTTP server whose `/` sets a new `rot=<n>` cookie on every
-/// request, like a rotating refresh token, and stores a localStorage key so a
-/// restore navigates back to it. Every other path sets nothing.
+/// request, like a rotating refresh token, and stores a localStorage key, so
+/// a request for `/` shows in the cookie. Every other path sets nothing.
 async fn start_rotating_cookie_server() -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -11314,8 +11314,8 @@ async fn e2e_restore_shared_key_keeps_sign_in_from_session_that_closed_first() {
 
 #[tokio::test]
 #[ignore]
-async fn e2e_restore_saves_cookie_rotated_while_restoring_storage() {
-    let restore_key = format!("e2e-rotate-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+async fn e2e_restore_loads_storage_without_visiting_its_origins() {
+    let restore_key = format!("e2e-blank-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let env = EnvGuard::new(&[
         "AGENT_BROWSER_SESSION_NAME",
         "AGENT_BROWSER_RESTORE_SAVE",
@@ -11328,11 +11328,12 @@ async fn e2e_restore_saves_cookie_rotated_while_restoring_storage() {
     env.remove("AGENT_BROWSER_ENCRYPTION_KEY");
 
     let (base_url, _server) = start_rotating_cookie_server().await;
-    let open = |id: &str, url: String| json!({ "id": id, "action": "navigate", "url": url, "restoreKey": restore_key });
 
+    // A opens `/`, which sets rot=1 and localStorage k=v, and saves both.
     let mut a = DaemonState::new();
     a.session_id = "e2e-a".to_string();
-    assert_success(&execute_command(&open("1", format!("{}/", base_url)), &mut a).await);
+    let open_a = json!({ "id": "1", "action": "navigate", "url": format!("{}/", base_url), "restoreKey": restore_key });
+    assert_success(&execute_command(&open_a, &mut a).await);
     let resp = execute_command(&json!({ "id": "2", "action": "close" }), &mut a).await;
     assert_eq!(get_data(&resp)["saveStatus"], "saved");
     assert_eq!(
@@ -11340,34 +11341,35 @@ async fn e2e_restore_saves_cookie_rotated_while_restoring_storage() {
         Some("1")
     );
 
-    // Restoring the saved localStorage navigates B back to `/`, which rotates
-    // the cookie before B ever opens `/other`.
+    // B's launch restores both and leaves its tab where it was: restoring
+    // used to navigate the session's tab to every saved origin, which left
+    // new sessions on other sessions' pages.
     let mut b = DaemonState::new();
     b.session_id = "e2e-b".to_string();
-    let resp = execute_command(&open("3", format!("{}/other", base_url)), &mut b).await;
-    assert_success(&resp);
-    assert_eq!(get_data(&resp)["lifecycle"]["restoreStatus"], "loaded");
-    // Chrome may request `/` more than once while restoring, so read the
-    // value B holds instead of assuming one rotation.
     let resp = execute_command(
-        &json!({ "id": "4", "action": "evaluate", "script": "document.cookie" }),
+        &json!({ "id": "3", "action": "launch", "headless": true, "restoreKey": restore_key }),
         &mut b,
     )
     .await;
     assert_success(&resp);
-    let rotated = get_data(&resp)["result"]
-        .as_str()
-        .and_then(|c| c.strip_prefix("rot="))
-        .map(str::to_string);
-    assert!(
-        rotated.as_deref().is_some_and(|v| v != "1"),
-        "restore should rotate the cookie: {:?}",
-        rotated
-    );
-    let resp = execute_command(&json!({ "id": "5", "action": "close" }), &mut b).await;
+    assert_eq!(get_data(&resp)["lifecycle"]["restoreStatus"], "loaded");
+    let resp = execute_command(&json!({ "id": "4", "action": "url" }), &mut b).await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["url"], "about:blank");
+
+    // B opens another page of the site: the cookie is still the saved one,
+    // so the restore never requested `/`, and the saved localStorage is there.
+    let open_b = json!({ "id": "5", "action": "navigate", "url": format!("{}/other", base_url) });
+    assert_success(&execute_command(&open_b, &mut b).await);
+    assert_evaluate(&mut b, "6", "document.cookie", json!("rot=1")).await;
+    assert_evaluate(&mut b, "7", "localStorage.getItem('k')", json!("v")).await;
+    let resp = execute_command(&json!({ "id": "8", "action": "close" }), &mut b).await;
     assert_eq!(get_data(&resp)["saveStatus"], "saved");
 
-    assert_eq!(newest_saved_cookie(&restore_key, "rot"), rotated);
+    assert_eq!(
+        newest_saved_cookie(&restore_key, "rot").as_deref(),
+        Some("1")
+    );
     cleanup_restore_state_files(&restore_key);
 }
 
